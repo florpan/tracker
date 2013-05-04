@@ -112,7 +112,7 @@
     <script>
         $(function(){
             window.t = new Tracker("#player");
-            t.load('http://www.flossy.se/ba1clean.json',function(){
+            t.load('http://www.flossy.se/tracker/ba1.json',function(d){
                 function updateplaypause(playing) {
                     $("#playpause").html(playing ? "<i class='icon-pause'></i> Pause" : "<i class='icon-play'></i> Play")
                             .removeClass('btn-success').removeClass('btn-danger')

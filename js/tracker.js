@@ -8,8 +8,9 @@ function debug(){
 
 function Tracker(playerSelector){
     playerSelector = playerSelector || "#player";
+    var downSample = 1, channelMix = true;
     var context = window.webkitAudioContext ? new webkitAudioContext() : new AudioContext(),
-        sampleRate = context.sampleRate,
+        sampleRate = context.sampleRate / downSample,
         compressor = context.createDynamicsCompressor(),
         processor = context.createScriptProcessor(2048);//.createJavaScriptNode(2048, 1, 2),
         filter = context.createBiquadFilter(),
@@ -20,9 +21,15 @@ function Tracker(playerSelector){
         patternPos = 0,
         rowIndex = -1,
         currentTick = 0,
+        speed = 3,
         currentPattern = null;
         visiblePattern = -1,
+        minPeriod = 1,
+        maxPeriod = 150, //?? ingen aning om vad som är rimligt
+        singlePattern = false,
         song = null;
+
+    debug('sample rate down from ' + context.sampleRate + ' to ' + sampleRate);
 
     //init audio
     window._trackerprocessormethod = process; //dummmy to keep chrome's GC from interfering
@@ -35,6 +42,7 @@ function Tracker(playerSelector){
     // Public
     this.onLoaded = function(data) {
         song = data;
+        speed = song.InitialSpeed;
         initInstruments();
         initLayout();
         showPattern(song.Positions[0]);
@@ -46,6 +54,69 @@ function Tracker(playerSelector){
     };
     this.getSong = function() {
         return song;
+    };
+    this.getChannel = function(i) {
+        return channels[i];
+    };
+    this.setPosition = function(pos){
+        patternPos = pos;
+        showPattern(song.Positions[patternPos]);
+        return this;
+    };
+    this.setMute = function(positions){
+        for(var i=0;i<channels.length; i++) channels[i].muted = false;
+        $.each(positions,function(){debug('muting ' + this); channels[Number(this)].muted = true;});
+        return this;
+    };
+    this.setSinglePattern = function(v) {
+        singlePattern = v;
+    };
+    this.getEffectSummary = function(){
+        var out = [], p, t,c;
+        try {
+        for(p=0; p<song.Patterns.length; p++)
+        {
+            var pat = song.Patterns[p];
+            for(t=0; t<pat.Tracks.length; t++)
+            {
+                var trk = pat.Tracks[t];
+                for(c=0; c<trk.Cells.length; c++)
+                {
+                    var cell = trk.Cells[c];
+                    var fx = cell[0];
+                    var fxp = cell[1];
+                    if(fx > 0){
+                        var d = out[fx];
+                        if(!d){
+                            d = {fx: fx, w:[]};
+                            out[fx] = d;
+                        }
+                        d.w.push({p:p, t:t,c:c,v:fxp});
+                    }
+                }
+            }
+        }
+        }catch(err){
+            debug('Failed to read at ' + p + ':' + t + ':' + c);
+        }
+
+        $.each(out, function(f){
+            f = out[f];
+            if(!f)
+                return;
+            f.count = f.w.length;
+            f.avg = 0;
+            f.min = 100000;
+            f.max = 0;
+            $.each(f.w,function(){
+                f.avg += this.v;
+                f.min = f.min > this.v ? this.v : f.min;
+                f.max = f.max < this.v ? this.v : f.max;
+            });
+            f.avg /= f.count;
+        });
+        return out;
+
     };
 
     // /Public
@@ -65,12 +136,20 @@ function Tracker(playerSelector){
         isProcessing = true;
 
         var out=[];
-        for(var i=0; i<len; i++){
+        var last=0;
+        for(var i=0; i<len; i += downSample){
+            for(var j=last; j<i; j++){ //om nersamplad
+                buf[0][j] = out[0];
+                buf[1][j] = out[1];
+            }
+            last = i;
             update();
             out[0] = out[1] = 0.0;
             for(var c=0; c<song.ChannelsCount; c++)
             {
                 var channel = channels[c];
+                if(channel.muted)
+                    continue;
                 if ((channel.inst || channel.inst == 0) && channel.period != 96){
                     var instr = song.Instruments[channel.inst];
                     var buffer = instr.WaveData;
@@ -91,6 +170,11 @@ function Tracker(playerSelector){
                 }
             }
 
+            if(channelMix){
+                var t = out[0];
+                out[0] = t * 0.6 + out[1] * 0.4;
+                out[1] = t * 0.4 + out[1] * 0.6;
+            }
             buf[0][i] = out[0];
             buf[1][i] = out[1];
             tickOffset++;
@@ -145,6 +229,7 @@ function Tracker(playerSelector){
         channel.balance = 1 - (channelNum & 1) * 2;
 
         var tempNote = channel.period;
+        var tempFx = channel.fx;
         channel.tick = 0;
         channel.fx = e;
         channel.note = n;
@@ -164,6 +249,16 @@ function Tracker(playerSelector){
             channel.period = pr;//n != null ? o * 12 + n : -1;
             channel.samplepos = 0;
             channel.looping = false;
+            channel.recalc = true;
+        }
+
+
+        channel.slidespeed = 0;
+        if(e == 1){
+            channel.slidespeed = channel.fxp;
+        }
+        if(e == 2){
+            channel.slidespeed = -channel.fxp;
         }
 
         if (e == 3) e = -1;
@@ -189,17 +284,31 @@ function Tracker(playerSelector){
         }
 
         if (e == 12) {
-            channel.volume *= (p || channel.fxp) / 256.0;
+            channel.volume = channel.fxp / 64.0;//*= (p || channel.fxp) / 256.0;
         }
 
-        if (channel.note != null) {
-            channel.rate = getRate(channel.period, song.Instruments[channel.inst], 0);
-        }
+        /*if (channel.recalc) {
+            recalc(channel);
+        }*/
 
         updateChannel(channel);
     }
 
+    function recalc(channel){
+        channel.rate = getRate(channel.period, song.Instruments[channel.inst], 0);
+        channel.recalc = false;
+    }
+
     function updateChannel(channel) {
+        if(channel.slidespeed){
+            channel.period += channel.slidespeed / 256*12.0; //en oktav per 256 speed
+            /*if(channel.period < minPeriod)
+                channel.period = minPeriod;
+            else if(channel.period > maxPeriod)
+                channel.period = maxPeriod;*/
+            channel.recalc = true;
+        }
+
         if (channel.portSpeed) {
             //channel.port += channel.portSpeed;
             console.log([rowIndex, tick, 'port', channel.portSpeed, channel.port, channel.portTarget]);
@@ -219,10 +328,20 @@ function Tracker(playerSelector){
             }
             channel.rate = freq2rate(channel.port);//getRate(channel.period, song.Instruments[channel.inst], 0);
         }
+
+        if (channel.recalc) {
+            recalc(channel);
+        }
+
     }
 
     function patternEnded() {
         if (isPlaying) {
+            if(singlePattern)
+            {
+                rowIndex = 0;
+                return;
+            }
             patternPos++;
             if (patternPos < song.Positions.length) {
                 var p = song.Positions[patternPos];
@@ -276,7 +395,7 @@ function Tracker(playerSelector){
     function getLogPeriod(note, fine) {
         var n, o, p1, p2, i;
 
-        n = note % 12;
+        n = Math.round(note) % 12;
         o = Math.floor(note / 12);
         i = (n << 3) + (fine >> 4); /* n*8 + fine/16 */
 
@@ -306,10 +425,31 @@ function Tracker(playerSelector){
         if (c2spd == 0)
             return 4242;
 
-        var n = (note % 12);
+        var nn = Math.floor(note);
+        var n = nn % 12;
         var o = Math.floor(note / 12);
 
-        return ((8363 * mytab[n]) >> o) / c2spd;
+        //return ((8363 * mytab[n]) >> o) / c2spd;
+
+        //test interpolering.
+        var d = note - nn;
+        var dl = ((8363 * mytab[n]) >> o);
+
+        if(d == 0)
+            return dl / c2spd;
+
+        n++;
+        if(n >= mytab.length){
+            n = 0;
+            o++;
+        }
+        var dh = ((8363 * mytab[n]) >> o);
+
+        var res = (dl * (1-d) + (dh * d));
+
+        //test slut, verkar smutt
+        return res / c2spd;
+
     }
 
     function toWord(lsb, msb) {
