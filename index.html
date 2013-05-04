@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>jsTracker</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Bootstrap -->
+	
+	<link href="bootstrap/css/bootstrap.min.css" rel="stylesheet" media="screen">
+      <link href="bootstrap/css/bootstrap-responsive.min.css" rel="stylesheet">
+      <link href="http://bootswatch.com/slate/bootstrap.min.css" rel="stylesheet" media="screen">
+
+    <link href="http://bootswatch.com/css/font-awesome.min.css" rel="stylesheet">
+    <link href="http://bootswatch.com/css/bootswatch.css" rel="stylesheet">
+    <style>
+        #player {
+            overflow:auto;
+            background-color: rgba(0,0,0,0.3);
+            border: 1px solid rgba(0,0,0,0.5);
+            box-shadow: 0 0 20px rgba(0,0,0,0.3),inset 0 0 30px rgba(0,0,0,0.9);
+
+            height:400px;
+            position:relative;
+            font-family:monospace;
+            font-size:10px;
+            height: 400px;
+            text-transform: uppercase;
+        }
+        .track{ margin:200px 0; display:none; }
+        .row { clear:both; margin-left: 10px; }
+        .note { width:95px; margin: 0px 5px; }
+        .note, .tone, .instrument, .vol, .fx, .fxp {
+            float:left;
+            margin-left:2px;
+            font-weight:bold;
+            font-size:11px;
+        }
+        .instrument {
+            color:#80e0ff;
+        }
+        .vol {
+            color:#80ff80;
+        }
+        .fx {
+            color:#ff80e0;
+        }
+        .fxp  {
+            color:#ffe080;
+        }
+        #currentRow {
+            position:relative;
+        }
+        #currentRow #inner {
+            border:1px solid rgba(255,255,255,0.5);
+            background-color: rgba(255,255,255,0.1);
+            height:19px;
+            width:919px;
+            opacity:0.6;
+            position:absolute;
+            top:-202px;
+            margin-left: 1px;
+            border-left: none;
+            border-right: none;
+        }
+
+        body { padding-top:80px; }
+        .subhead > div:first-child { min-height: 140px; }
+    </style>
+  </head>
+  <body>
+	<div class="navbar navbar-fixed-top">
+	  <div class="navbar-inner">
+		<div class="container">
+		  <ul class="nav">
+			<li class="active"><a href="#">Home</a></li>
+			<li><a href="#">Projects</a></li>
+			<li><a href="#">Services</a></li>
+			<li><a href="#">Downloads</a></li>
+			<li><a href="#">About</a></li>
+			<li><a href="#">Contact</a></li>
+		  </ul>
+
+            <button id="playpause" class="btn btn-success btn-small" style="display: none"><i class='icon-play'></i> Play</button>
+
+        </div>
+	  </div>
+	</div><!-- /.navbar -->    
+
+	<div class="container">
+	
+		<header class="jumbotron subhead" id="overview">
+		  <div class="row">
+			<div class="span6">
+			  <h1>jsTracker</h1>
+			  <p class="lead">yada yada yada?</p>
+			</div>
+			<div class="span6">
+				<!-- h�ger.. -->
+			</div>
+		  </div>
+		</header>
+
+
+        <div class="section" id="player">
+        </div>
+        <div id="currentRow"><div id="inner"></div></div>
+        
+    </div>
+    <script src="http://code.jquery.com/jquery.js"></script>
+    <script src="bootstrap/js/bootstrap.min.js"></script>
+    <script src="js/tracker.js"></script>
+    <script>
+        $(function(){
+            window.t = new Tracker("#player");
+            t.load('http://www.flossy.se/ba1clean.json',function(){
+                function updateplaypause(playing) {
+                    $("#playpause").html(playing ? "<i class='icon-pause'></i> Pause" : "<i class='icon-play'></i> Play")
+                            .removeClass('btn-success').removeClass('btn-danger')
+                            .addClass(playing ? 'btn-danger' : 'btn-success');
+                }
+                $("#playpause").show();
+                $("#playpause").click(function(){ updateplaypause(t.togglePlay()); });
+            });
+        });
+    </script>
+  </body>
+</html>
