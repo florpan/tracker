@@ -12,6 +12,9 @@
 
     <link href="http://bootswatch.com/css/font-awesome.min.css" rel="stylesheet">
     <link href="http://bootswatch.com/css/bootswatch.css" rel="stylesheet">
+
+      <link href="css/jquery.pnotify.default.css" rel="stylesheet">
+
     <style>
         #player {
             overflow:auto;
@@ -26,20 +29,28 @@
             height: 400px;
             text-transform: uppercase;
         }
-        .track{ margin:200px 0; display:none; }
+        .track{ margin:150px 0; display:none; margin-bottom: 239px; }
         .row { clear:both; margin-left: 10px; }
-        .note { width:95px; margin: 0px 5px; }
-        .note, .tone, .instrument, .vol, .fx, .fxp {
+        .note { width:80px; margin: 0px 5px; color:#80ff80; }
+        .note, .tone, .instrument, .vol, .fx, .fxp, .num {
             float:left;
             margin-left:2px;
             font-weight:bold;
             font-size:11px;
+            line-height: 12px;
         }
         .instrument {
             color:#80e0ff;
         }
         .vol {
             color:#80ff80;
+            display: none;
+        }
+        .num {
+            margin-right: 5px;
+        }
+        .num.hl {
+            color:#ffff80;
         }
         .fx {
             color:#ff80e0;
@@ -47,17 +58,23 @@
         .fxp  {
             color:#ffe080;
         }
+        .nonote {
+            border: solid 1px;
+            width: 19px;
+            height: 7px;
+            margin-top: 2px;
+        }
         #currentRow {
             position:relative;
         }
         #currentRow #inner {
             border:1px solid rgba(255,255,255,0.5);
             background-color: rgba(255,255,255,0.1);
-            height:19px;
+            height:13px;
             width:919px;
             opacity:0.6;
             position:absolute;
-            top:-202px;
+            top:-252px;
             margin-left: 1px;
             border-left: none;
             border-right: none;
@@ -65,6 +82,24 @@
 
         body { padding-top:80px; }
         .subhead > div:first-child { min-height: 140px; }
+        .c0disabled .c0, .c1disabled .c1, .c2disabled .c2, .c3disabled .c3, .c4disabled .c4, .c5disabled .c5, .c6disabled .c6, .c7disabled .c7, .c8disabled .c8, .c9disabled .c9, .c10disabled .c10,
+        .c11disabled .c11, .c12disabled .c12, .c13disabled .c13, .c14disabled .c14, .c15disabled .c15, .c16disabled .c16, .c17disabled .c17, .c18disabled .c18, .c19disabled .c19, .c20disabled .c20,
+        .c21disabled .c21, .c22disabled .c22, .c23disabled .c23, .c24disabled .c24, .c25disabled .c25, .c26disabled .c26, .c27disabled .c27, .c28disabled .c28, .c29disabled .c29, .c30disabled .c30,
+        .c30disabled .c30, .c31disabled .c31
+        { opacity: 0.3; text-shadow: 0 0 5px; }
+        .controls, .controls label {
+            color: #7a8288;
+            font-weight: bold;
+            text-shadow: -1px -1px 0 rgba(0,0,0,0.3);
+        }
+        .controls label {
+            display: inline-block;
+            margin-right: 10px;
+            margin-top: 0;
+            margin-bottom: 0;
+            line-height: 5px;
+        }
+        #info { text-align:center; height:21px; }
     </style>
   </head>
   <body>
@@ -101,18 +136,28 @@
 		</header>
 
 
+        <div class="controls">
+            <div id="mutes"></div>
+            <div id="info"></div>
+        </div>
         <div class="section" id="player">
         </div>
         <div id="currentRow"><div id="inner"></div></div>
-        
+
+        <div class="section" id="debug">
+        </div>
+
     </div>
     <script src="http://code.jquery.com/jquery.js"></script>
     <script src="bootstrap/js/bootstrap.min.js"></script>
     <script src="js/tracker.js"></script>
+    <script src="js/jquery.pnotify.min.js"></script>
     <script>
         $(function(){
             window.t = new Tracker("#player");
-            t.load('http://www.flossy.se/tracker/ba1.json',function(d){
+            var songs = ['http://www.flossy.se/tracker/ba1.json','http://www.flossy.se/tracker/dreamoff.json','http://www.flossy.se/tracker/StateOfTheArt.json',
+                'http://www.flossy.se/tracker/utmenu.json','http://www.flossy.se/tracker/aryx.json','http://www.flossy.se/tracker/robyn.json'];
+            t.load(songs[3],function(d){
                 function updateplaypause(playing) {
                     $("#playpause").html(playing ? "<i class='icon-pause'></i> Pause" : "<i class='icon-play'></i> Play")
                             .removeClass('btn-success').removeClass('btn-danger')
@@ -120,8 +165,30 @@
                 }
                 $("#playpause").show();
                 $("#playpause").click(function(){ updateplaypause(t.togglePlay()); });
+                $("#mutes").empty();
+
+                window.song = t.getSong();
+
+                t.onUpdate(function(pos, pat, speed,bpm){
+                    $("#info").html('Position: ' + pos + ' Pattern:' + pat + ' Speed: ' + speed + ' Bpm:' + bpm);
+                });
+
+                for(var i=0; i<song.ChannelsCount; i++){
+                    $("#mutes").append('<input id="mute'+i+'" type="checkbox" data-channel="' + i + '" class="mute" checked/> <label for="mute'+i+'">' + (i+1) + '</label>');
+                }
+            });
+
+            $("#mutes").on("change",".mute", function(){
+                t.mute(Number($(this).data("channel")),!$(this).is(":checked"));
             });
         });
+
+        function dumpInstrument(song, i){
+            var ins = song.Instruments[i], c = plotAudio(ins.WaveData, 650,300);
+            $("#debug").empty().append(c);
+            $("#debug").append("<strong>"+ extractFlags(ins.Samples[0].Flags) + "</strong>");
+        }
+
     </script>
   </body>
 </html>

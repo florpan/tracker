@@ -1,25 +1,27 @@
 /* support */
 function debug(){
     if(window.console && console.log)
-        console.log(arguments);
+        console.log.call(console,arguments);
 }
 /* /support */
 
 
 function Tracker(playerSelector){
     playerSelector = playerSelector || "#player";
-    var downSample = 1, channelMix = true;
+    var downSample = 1, channelMix = true, self = this;
     var context = window.webkitAudioContext ? new webkitAudioContext() : new AudioContext(),
+        bufferSize = 4096,
         sampleRate = context.sampleRate / downSample,
         compressor = context.createDynamicsCompressor(),
-        processor = context.createScriptProcessor(2048);//.createJavaScriptNode(2048, 1, 2),
+        processor = context.createScriptProcessor(bufferSize);//.createJavaScriptNode(2048, 1, 2),
         filter = context.createBiquadFilter(),
+        player = $(playerSelector),
+        playerElement = player[0],
         channels = [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}],
         isPlaying = false,
-        isProcessing = false,
         tickOffset = 0,
         patternPos = 0,
-        rowIndex = -1,
+        rowIndex = 0,
         currentTick = 0,
         speed = 3,
         currentPattern = null;
@@ -27,12 +29,18 @@ function Tracker(playerSelector){
         minPeriod = 1,
         maxPeriod = 150, //?? ingen aning om vad som är rimligt
         singlePattern = false,
-        song = null;
+        song = null,
+        maxProcessTime = 1000 * bufferSize / sampleRate,
+        tickRate = 0,
+        updateCallback = null,
+        patternJumpPos = null,
+        patternBreakPos = null;
 
-    debug('sample rate down from ' + context.sampleRate + ' to ' + sampleRate);
+    if(downSample != 1)
+        debug('sample rate down from ' + context.sampleRate + ' to ' + sampleRate);
 
     //init audio
-    window._trackerprocessormethod = process; //dummmy to keep chrome's GC from interfering
+    window._trackerprocessor = processor; //dummmy to keep chrome's GC from interfering
     processor.onaudioprocess = process;
     filter.frequency.value=6000;
     processor.connect(filter);
@@ -40,16 +48,27 @@ function Tracker(playerSelector){
     compressor.connect(context.destination);
 
     // Public
+    this.onUpdate = function(f){ updateCallback = f;};
     this.onLoaded = function(data) {
         song = data;
         speed = song.InitialSpeed;
+        tempo = song.InitialTempo;
+        //måste räknas om, men den kan ligga här så länge iom att inga effekter som ändrar hastigheten
+        tickRate = sampleRate*60 / tempo / 4 / 6; //byte per sek / beats per min / 4 notes per beat
         initInstruments();
         initLayout();
         showPattern(song.Positions[0]);
+        for(var i=0; i<channels.length; i++)
+        {
+            channels[i].volume = 1;//TODO: resetta hela klabbet
+            channels[i].pan = 0.5;//i & 1;
+            channels[i].tremortoggle = 1;
+        }
     };
 
     this.togglePlay = function(){
         isPlaying = !isPlaying;
+        notifyChange();
         return isPlaying;
     };
     this.getSong = function() {
@@ -59,19 +78,62 @@ function Tracker(playerSelector){
         return channels[i];
     };
     this.setPosition = function(pos){
+        rowIndex = 0;
+        currentTick = 0;
+        tickOffset = 0;
         patternPos = pos;
         showPattern(song.Positions[patternPos]);
         return this;
     };
+    this.goto = function(o/*{p:0,r0}*/){
+        var pos = -1;
+        for(var i=0; i<song.Positions && pos == -1; i++){
+            if(song.Positions[i] == o.p)
+                pos = i;
+        }
+        if(i > -1){
+            self.setPosition(i);
+            rowIndex = o.r;
+            scrollPatternTo(rowIndex);
+            notifyChange();
+        } else {
+            console.log('goto failed',o);
+        }
+    };
     this.setMute = function(positions){
-        for(var i=0;i<channels.length; i++) channels[i].muted = false;
-        $.each(positions,function(){debug('muting ' + this); channels[Number(this)].muted = true;});
+        self.unmuteAll();
+        $.each(positions,function(){ self.mute(this);});
+        return this;
+    };
+    this.unmuteAll = function(){
+        for(var i=0;i<channels.length; i++) self.unmute(i);
+        return this;
+    };
+    this.muteAll = function(){
+        for(var i=0;i<channels.length; i++) self.mute(i);
+        return this;
+    };
+    this.mute = function(channel, val){
+        if(val != null && !val)
+        {
+            self.unmute(channel);
+            return this;
+        }
+        channels[channel].muted = true;
+        player.addClass("c" + channel + "disabled");
+        return this;
+    };
+    this.unmute = function(channel){
+        channels[channel].muted = false;
+        player.removeClass("c" + channel + "disabled");
         return this;
     };
     this.setSinglePattern = function(v) {
         singlePattern = v;
+        return this;
     };
-    this.getEffectSummary = function(){
+    var handledEffects = [1,2,3,5,8,9,10,12,13,14,15,16,17,18,19,21,23];
+    this.getEffectSummary = function(onlyUnhandled){
         var out = [], p, t,c;
         try {
         for(p=0; p<song.Patterns.length; p++)
@@ -85,13 +147,13 @@ function Tracker(playerSelector){
                     var cell = trk.Cells[c];
                     var fx = cell[0];
                     var fxp = cell[1];
-                    if(fx > 0){
+                    if(fx > 0 && (!onlyUnhandled || handledEffects.indexOf(fx) < 0)){
                         var d = out[fx];
                         if(!d){
                             d = {fx: fx, w:[]};
                             out[fx] = d;
                         }
-                        d.w.push({p:p, t:t,c:c,v:fxp});
+                        d.w.push({p:p, r:t,c:c,v:fxp});
                     }
                 }
             }
@@ -100,6 +162,7 @@ function Tracker(playerSelector){
             debug('Failed to read at ' + p + ':' + t + ':' + c);
         }
 
+        var o = [];
         $.each(out, function(f){
             f = out[f];
             if(!f)
@@ -114,14 +177,27 @@ function Tracker(playerSelector){
                 f.max = f.max < this.v ? this.v : f.max;
             });
             f.avg /= f.count;
+            o.push(f);
         });
-        return out;
+        return o;
 
     };
+    this.debugInfo = function(){
+        var t=0;
+        for(var i=0; i<10; i++)
+            t += processTimes[i];
 
+        return {avg: t / 10, tot: processedCount };
+    }
     // /Public
 
+    function notifyChange(){
+        if(updateCallback)
+            updateCallback(patternPos, song.Positions[patternPos], speed, tempo);
+    }
+
     function process(e) {
+        var start = window.performance.now();
         var buf=[e.outputBuffer.getChannelData(0), e.outputBuffer.getChannelData(1)];
         var len=e.outputBuffer.length;
         if (!isPlaying){
@@ -131,17 +207,13 @@ function Tracker(playerSelector){
             return;
         }
 
-        if(isProcessing)
-            debug('lag!');
-        isProcessing = true;
-
         var out=[];
         var last=0;
         for(var i=0; i<len; i += downSample){
-            for(var j=last; j<i; j++){ //om nersamplad
+            /*for(var j=last; j<i; j++){ //om nersamplad
                 buf[0][j] = out[0];
                 buf[1][j] = out[1];
-            }
+            }*/
             last = i;
             update();
             out[0] = out[1] = 0.0;
@@ -150,11 +222,10 @@ function Tracker(playerSelector){
                 var channel = channels[c];
                 if(channel.muted)
                     continue;
-                if ((channel.inst || channel.inst == 0) && channel.period != 96){
+                if ((channel.inst || channel.inst == 0) && channel.period != 96 && channel.tremortoggle){
                     var instr = song.Instruments[channel.inst];
                     var buffer = instr.WaveData;
 
-                    //console.log(c + '| ' + channel.samplepos);
                     if (buffer.length > channel.samplepos) {
                         var v = (1.0/song.ChannelsCount)* buffer[Math.floor(channel.samplepos)]*channel.volume;
 
@@ -162,61 +233,106 @@ function Tracker(playerSelector){
                         channel.samplepos += channel.rate;
                     }
 
-
-                    if(channel.samplepos >= buffer.length || (channel.looping && instr.Samples[0].LoopEnd && channel.samplepos >= instr.Samples[0].LoopEnd)){
+                    if(instr.Samples[0].Flags&sampleFlags.SF_NOLOOP && (channel.samplepos >= buffer.length || (channel.looping && instr.Samples[0].LoopEnd && channel.samplepos >= instr.Samples[0].LoopEnd)))
+                    {
                         channel.looping = true;
                         channel.samplepos = instr.Samples[0].LoopStart;
                     }
                 }
             }
 
-            if(channelMix){
-                var t = out[0];
-                out[0] = t * 0.6 + out[1] * 0.4;
-                out[1] = t * 0.4 + out[1] * 0.6;
+
+            var pan = channel.pan, pan2 = 1-pan;
+            var t = out[0];
+            out[0] = t * pan2 + out[1] * pan;
+            out[1] = t * pan + out[1] * pan2;
+
+            if(out[0] < -1 || out[0] > 1 || out[1] < -1 || out[1] > 1){
+                isPlaying = false;
+                console.log([out[0], out[1]]);
+                var b = 1;
             }
+
             buf[0][i] = out[0];
             buf[1][i] = out[1];
             tickOffset++;
         }
-        isProcessing = false;
+
+        if((window.performance.now() - start) > maxProcessTime)
+        {
+            console.log('lag!');
+        }
+        //trackProcessTime(window.performance.now() - start);
+    }
+
+    var processTimes = [], timingIndex = 0, processedCount =0;
+    function trackProcessTime(t){
+        processTimes[timingIndex] = t;
+        processedCount++;
+        timingIndex = (timingIndex + 1)%10;
     }
 
     function update(){
-        var tickRate = sampleRate*60 / song.InitialTempo / 4 / song.InitialSpeed; //byte per sek * 60 sek / beats per min / 4 notes per beat / notes per sek = bytes per sek
 
-        if(tickOffset>=tickRate) { tickOffset = 0;}
+        if(tickOffset>=tickRate) {
+            tickOffset = 0;
+
+            if(patternBreakPos != null || patternJumpPos != null){
+                rowIndex = patternBreakPos || 0;
+                if(patternJumpPos != null){
+                    patternPos = patternJumpPos;
+                } else {
+                    patternPos++;
+                }
+
+                patternBreakPos = null;
+                patternJumpPos = null;
+                currentTick = 0;
+                showPattern(song.Positions[patternPos]);
+                notifyChange();
+            }
+        }
         if (tickOffset == 0) {
-            currentTick = currentTick % song.InitialSpeed;
             handleTick(currentTick);
-            currentTick++;
+            currentTick = (currentTick + 1) % speed;
         }
     }
 
     function handleTick(tick) {
         currentPattern = song.Patterns[song.Positions[patternPos]];
         if (tick == 0) {
-            rowIndex++;
 
             if (rowIndex >= currentPattern.RowsCount) {
                 patternEnded();
+                notifyChange();
             }
 
             for (n = 0; n < song.ChannelsCount; n++) {
+                if(channels[n].muted)
+                    continue;
                 var note = currentPattern.Tracks[n].Cells[rowIndex];
                 playNote(n, note);
             }
 
+
             scrollPatternTo(rowIndex);
-        } else {
+        }
+        else {
             for (n = 0; n < song.ChannelsCount; n++) {
                 var channel = channels[n];
-                channel.tick = currentTick;
-                updateChannel(channel);
+                if(channel.muted)
+                    continue;
+                channel.tick = tick;
+                updateChannel(n,channel);
             }
+        }
+        if(tick == speed-1) {
+            rowIndex++;
         }
     }
 
+    var one64 = 1/64.0;
+    var one256 = 1/256.0;
     function playNote(channelNum, note) {
         var channel = channels[channelNum],
             n = note[NoteData.Note],
@@ -226,9 +342,9 @@ function Tracker(playerSelector){
             p = note[NoteData.EffectData],
             pr =note[NoteData.Period];
 
-        channel.balance = 1 - (channelNum & 1) * 2;
+        channel.tick = 0;
 
-        var tempNote = channel.period;
+        var tempNote = null;
         var tempFx = channel.fx;
         channel.tick = 0;
         channel.fx = e;
@@ -241,11 +357,12 @@ function Tracker(playerSelector){
             channel.inst = i - 1;
 
         var instr = song.Instruments[channel.inst];
-        if(instr){
-            channel.volume = instr.Samples[0].Volume / 64.0;
+        if(i && instr){
+            channel.volume = instr.Samples[0].Volume * one64; //Mja ja vet inte riktigt om den här ska sättas..
         }
 
         if(n != null){
+            tempNote = channel.period;
             channel.period = pr;//n != null ? o * 12 + n : -1;
             channel.samplepos = 0;
             channel.looping = false;
@@ -253,45 +370,105 @@ function Tracker(playerSelector){
         }
 
 
-        channel.slidespeed = 0;
-        if(e == 1){
-            channel.slidespeed = channel.fxp;
-        }
-        if(e == 2){
-            channel.slidespeed = -channel.fxp;
-        }
-
-        if (e == 3) e = -1;
-        if (e == 3 && tempNote && channel.inst) {//portamento to note
-            channel.portSpeed = channel.fxp;
-            channel.port = getPeriod(tempNote + instr.Samples[0].Transpose, instr.Samples[0].C2Spd);
-            channel.portTarget = getPeriod(channel.period + instr.Samples[0].Transpose, instr.Samples[0].C2Spd);
-            channel.portSpeed <<= 2;
-
-            if (channel.period > tempNote)//target < source, then reduce
-                channel.portSpeed = -channel.portSpeed;
-
-            channel.portTarget = getPeriod(channel.period + instr.Samples[0].Transpose, instr.Samples[0].C2Spd);
+        if(instr && e == 0){
+            //TODO
+            channel.arpeggio = [
+                channel.period,
+                getPeriod(n + instr.Samples[0].Transpose + (channel.fxp & 0xf0 >>4), instr.Samples[0].C2Spd),
+                getPeriod(n + instr.Samples[0].Transpose + (channel.fxp & 0x0f), instr.Samples[0].C2Spd)];
         } else {
-            channel.portSpeed = 0;
-            channel.port = 0;
+            channel.arpeggio = null;
         }
 
-        if (e == 9) // offset
+        if(e == 1 || e == 19){
+            channel.slidespeed = channel.fxp << 4;
+            channel.portTarget = 0;
+            //console.log('port up ', channel.fxp);
+        } else if(e == 2 || e == 18){
+            channel.slidespeed = -(channel.fxp << 4);
+            channel.portTarget = 0;
+            //console.log('port dn ', channel.fxp);
+        } else if ((e == 3 || e == 5) && channel.inst) {//portamento to note
+            if(tempNote){ //no note, no new slide. but keep existing
+                channel.slidespeed = channel.fxp << 4;
+                if (channel.period < tempNote)//target < source, then reduce
+                    channel.slidespeed = -channel.slidespeed;
+                //console.log('port to note from',tempNote, 'to', channel.period, 'by', channel.slidespeed);
+                channel.portTarget = channel.period;// getPeriod(channel.period + instr.Samples[0].Transpose, instr.Samples[0].C2Spd);
+                channel.period = tempNote; //keep old note and slide to it.
+            }
+        } else {
+            channel.slidespeed = 0;
+        }
+
+        //if(e == 4 || e == 6){} //vibrato, vibrato + volslide
+
+        if (e == 8) // offset
+        {
+            channel.pan = channel.fxp * one256;
+        }
+
+        if (e == 9 || e == 18) // offset
         {
             //channel.offset = channel.fxp << 8;
-            //channel.samplepos = channel.fxp << 8;
+            channel.samplepos = channel.fxp << 8;
         }
 
+        if(e == 10 || e == 17 || e == 5 || e == 6){ //volslide, port+volslide, vibrato+volslide
+            if(!p)
+                p = channel.fxp;
+            if((p&0xf0) == 0)
+                channel.volslide = -(p & 0xf);
+            else
+                channel.volslide = (p & 0xf0) >> 4;
+        } else {
+            channel.volslide = 0;
+        }
+
+        if(e == 11){
+            patternJumpPos = p;
+         }
         if (e == 12) {
-            channel.volume = channel.fxp / 64.0;//*= (p || channel.fxp) / 256.0;
+            channel.volume = p * one64;//*= (p || channel.fxp) / 256.0;
+        }
+        if(e == 13){
+            patternBreakPos = p; //p och inte fxp, dvs inte föregående värdet på hopp.
+        }
+        if(e == 14){
+            var mod = channel.fxp&0xf0,
+                d= channel.fxp&0x0f;
+            if(mod==160) { //ea
+                channel.volume += d*one64;
+                if(channel.volume >= 1) channel.volume = 1;
+            } else if(mod == 176){
+                channel.volume -= d*one64;
+                if(channel.volume <= 0) channel.volume = 0;
+            }
+        }
+        if(e == 15 || e == 16 || e == 22){ //skumt med 3 olika speed/bpm..
+            if(channel.fxp > 32){
+                tempo = channel.fxp;
+                tickRate = sampleRate*60 / tempo / 4 / 6;
+                notifyChange();
+            } else {
+                speed = channel.fxp;
+            }
+        }
+        if(e == 21){ //s3m-e
+            channel.retrig = channel.fxp;
+        } else  {
+            channel.retrig = 0;
+        }
+        if(e == 23){
+            channel.tremor = [(channel.fxp & 0xf0) >> 4, channel.fxp & 0xf];
+            channel.tremorindex = 0;
+            channel.tremortoggle = 1;
+        } else {
+            channel.tremor = null;
+            channel.tremortoggle = 1;
         }
 
-        /*if (channel.recalc) {
-            recalc(channel);
-        }*/
-
-        updateChannel(channel);
+        updateChannel(channelNum, channel);
     }
 
     function recalc(channel){
@@ -299,16 +476,55 @@ function Tracker(playerSelector){
         channel.recalc = false;
     }
 
-    function updateChannel(channel) {
-        if(channel.slidespeed){
-            channel.period += channel.slidespeed / 256*12.0; //en oktav per 256 speed
-            /*if(channel.period < minPeriod)
-                channel.period = minPeriod;
-            else if(channel.period > maxPeriod)
-                channel.period = maxPeriod;*/
+    function updateChannel(chid, channel) {
+        if(channel.tick && channel.slidespeed){
+            var p = channel.period,
+                inc = channel.slidespeed >> 8;
+            channel.period += inc;//(10.0*channel.slidespeed) / 256.0; //en oktav per 256 speed
+
+            //console.log('port by', inc, 'from',p,'to', channel.period, '[',channel.portTarget,']');
+            if(channel.portTarget){
+                if((channel.period <= channel.portTarget && channel.slidespeed < 0) ||
+                   (channel.period >= channel.portTarget && channel.slidespeed > 0)){
+                    channel.period = channel.portTarget;
+                    channel.portTarget = 0;
+                    channel.slidespeed = 0;
+                    //console.log('port to note ended');
+                }
+            }
             channel.recalc = true;
         }
+        if(channel.retrig && (channel.tick % channel.retrig) == 0){
+            debug('retrig ' + channel.retrig);
+            channel.samplepos = 0;
+        }
 
+        if(channel.volslide){
+            var vol = channel.volume + channel.volslide * one64;
+            channel.volume = vol < 0 ? 0 : vol > 1 ? 1 : vol;
+        }
+        if(channel.tremor){
+            //console.log('tremor - ',rowIndex, currentTick, channel.tremorindex, channel.tremortoggle);
+            if(channel.tremortoggle == 1)
+            {
+                if(channel.tremorindex == channel.tremor[1]){
+                    //  console.log('tremor off',rowIndex, currentTick, channel.tremorindex);
+                    channel.tremortoggle = 0;
+                    channel.tremorindex = 0;
+                } else {
+                    channel.tremorindex++;
+                }
+            } else {
+                if(channel.tremorindex == channel.tremor[0]){
+                    //console.log('tremor on',rowIndex, currentTick, channel.tremorindex);
+                    channel.tremortoggle = 1;
+                    channel.tremorindex = 0;
+                } else {
+                    channel.tremorindex++;
+                }
+            }
+        }
+/*
         if (channel.portSpeed) {
             //channel.port += channel.portSpeed;
             console.log([rowIndex, tick, 'port', channel.portSpeed, channel.port, channel.portTarget]);
@@ -328,7 +544,7 @@ function Tracker(playerSelector){
             }
             channel.rate = freq2rate(channel.port);//getRate(channel.period, song.Instruments[channel.inst], 0);
         }
-
+*/
         if (channel.recalc) {
             recalc(channel);
         }
@@ -483,7 +699,7 @@ function Tracker(playerSelector){
         var r = sample.SampleRate;
 
         if (sample.Flags & sampleFlags.SF_16BITS) {
-            var data = new Float32Array(sample.Length / 2);
+            var data = new Float32Array(Math.floor(sample.Length / 2));
 
             for (var i = 0; i < s.length; i += 2) {
                 n = toWord(s[i], s[i+1]);
@@ -519,26 +735,32 @@ function Tracker(playerSelector){
     }
 
     function scrollPatternTo(index) {
-        $(playerSelector)[0].scrollTop = 21*index;
+        setTimeout(function(){
+            playerElement.scrollTop = 12*index;
+        },0);
     }
 
     function createPattern(p){
         var pat = song.Patterns[p],
             tracks = pat.Tracks,
-            rows = pat.RowsCount;
+            rows = pat.RowsCount,
+            w = tracks.length < 11 ? '' : ' style="width:' + (tracks.length * 90 + 20) + 'px"';
+
         if(!pat.html){
             pat.html = "#pattern" + p;
-            var data = '<div class="track" id="pattern'+p+'">';
+            var data = '<div class="track" id="pattern'+p+'"' + w + '>';
             for(var n=0;n<rows; n++)
             {
                 data += '<div class="row">';
+                data += "<div class=\"num" + ((n%4 == 0) ? " hl" : "") + "\">" + fillZero(n.toString(16)) + "</div>";
                 for (var r = 0; r < tracks.length; r++)
                 {
                     var cells = tracks[r].Cells;
-                    data += "<div class=\"note\">";
-                    data += "<div class=\"tone\">" + toNote(cells[n][NoteData.Note], cells[n][NoteData.Octave]) + "</div>";
+                    var nonote = cells[n][NoteData.Period] == 96;
+                    data += "<div class=\"note c" + r + "\">";
+                    data += "<div class=\"tone\">" + (nonote ? '<div class="nonote"></div>' : toNote(cells[n][NoteData.Note], cells[n][NoteData.Octave])) + "</div>";
                     data += "<div class=\"instrument\">" + formatInstrument(cells[n][NoteData.Instrument]) + "</div>";
-                    data += "<div class=\"vol\">" + formatVolume(cells[n][NoteData.Period]) + "</div>";
+                    //data += "<div class=\"vol\">" + formatVolume(cells[n][NoteData.Period]) + "</div>";
                     data += "<div class=\"fx\">" + formatFx(cells[n][NoteData.Effect]) + "</div>";
                     data += "<div class=\"fxp\">" + formatFxP(cells[n][NoteData.EffectData]) + "</div>";
                     data += "</div>";
@@ -547,6 +769,7 @@ function Tracker(playerSelector){
             }
             data += '</div>';
             $(playerSelector).append(data);
+            pat.element = $(pat.html)[0];
         }
     }
 
@@ -595,13 +818,20 @@ function Tracker(playerSelector){
         return fillZero(i.toString(16));
     }
 
+    var lastPattern=null;
     function showPattern(p) {
         if(visiblePattern == p)
             return;
-        $("#pattern" + visiblePattern).hide();
+
+        if(lastPattern)
+            lastPattern.style.display = "none";
+
+        //$("#pattern" + visiblePattern).hide();
         visiblePattern = p;
 
-        $(song.Patterns[p].html).show();
+        song.Patterns[p].element.style.display = "block";
+        lastPattern = song.Patterns[p].element;
+        //$(song.Patterns[p].html).show();
     }
 
 }
@@ -617,12 +847,61 @@ Tracker.prototype.load = function(url, onloaded){
 
 
 
+function plotAudio(data, width, height) {
+    width = width || 1280;
+    height = height || 200;
+    var $canvas = $('<canvas>').attr({ width: width, height: height }).css({ cursor: 'pointer' }),
+        ctx = $canvas[0].getContext('2d'),
+        dw = width / data.length, x = 0, h2 = height / 2;
+    ctx.strokeStyle = '#FFF';
+    ctx.beginPath();
+    ctx.moveTo(x, h2);
+    for (var i = 0; i < data.length; ++i) {
+        ctx.lineTo(x, h2 + h2 * data[i]);
+        x += dw;
+    }
+    ctx.stroke();
+
+    return $canvas;
+}
+
+function extractFlags(f) {
+    var s = "";
+    if ((f & sampleFlags.SF_16BITS) != 0) {
+        s += "|16Bit";
+    }
+    if ((f & sampleFlags.SF_BIDI) != 0) {
+        s += "|BIDI";
+    }
+    if ((f & sampleFlags.SF_BIG_ENDIAN) != 0) {
+        s += "|Big_Endian";
+    }
+    if ((f & sampleFlags.SF_DELTA) != 0) {
+        s += "|Delta";
+    }
+    if ((f & sampleFlags.SF_NOLOOP) != 0) {
+        s += "|NoLoop";
+    }
+    if ((f & sampleFlags.SF_OWNPAN) != 0) {
+        s += "|Ownpan";
+    }
+    if ((f & sampleFlags.SF_REVERSE) != 0) {
+        s += "|Reverse";
+    }
+    if ((f & sampleFlags.SF_SIGNED) != 0) {
+        s += "|Signed";
+    }
+    if (s.length > 0)
+        return s.substring(1);
+
+    return "";
+}
 
 //constants, tables etc
 var NoteData = { Effect:0, EffectData:1, Instrument:2, Note:3, Octave:4, Period:5},
     LOGFAC = 2 * 16,
     modFlags = { UF_XMPERIODS: 1, UF_LINEAR: 2 },
-    sampleFlags = { SF_16BITS:1, SF_SIGNED:2, SF_DELTA:4, SF_BIG_ENDIAN:8, SF_LOOP:16, SF_BIDI:32, SF_OWNPAN:64, SF_REVERSE:128 },
+    sampleFlags = { SF_16BITS:1, SF_SIGNED:2, SF_DELTA:4, SF_BIG_ENDIAN:8, SF_NOLOOP:16, SF_BIDI:32, SF_OWNPAN:64, SF_REVERSE:128 },
     mytab = [(1712 * 16), (1616 * 16), (1524 * 16), (1440 * 16), (1356 * 16), (1280 * 16), (1208 * 16), (1140 * 16), (1076 * 16), (1016 * 16), (960 * 16), (907 * 16) ],
     lintab = [16726, 16741, 16756, 16771, 16786, 16801, 16816, 16832, 16847, 16862, 16877, 16892, 16908, 16923, 16938, 16953, 16969, 16984, 16999, 17015, 17030, 17046, 17061, 17076, 17092, 17107, 17123, 17138, 17154, 17169, 17185, 17200, 17216, 17231, 17247, 17262, 17278, 17293, 17309, 17325, 17340, 17356, 17372, 17387, 17403, 17419, 17435, 17450, 17466, 17482, 17498, 17513, 17529, 17545, 17561, 17577, 17593, 17608, 17624, 17640, 17656, 17672, 17688, 17704, 17720, 17736, 17752, 17768, 17784, 17800, 17816, 17832, 17848, 17865, 17881, 17897, 17913, 17929, 17945, 17962, 17978, 17994, 18010, 18027, 18043, 18059, 18075, 18092, 18108, 18124, 18141, 18157, 18174, 18190, 18206, 18223, 18239, 18256, 18272, 18289, 18305, 18322, 18338, 18355, 18372, 18388, 18405, 18421, 18438, 18455, 18471, 18488, 18505, 18521, 18538, 18555, 18572, 18588, 18605, 18622, 18639, 18656, 18672, 18689, 18706, 18723, 18740, 18757, 18774, 18791, 18808, 18825, 18842, 18859, 18876, 18893, 18910, 18927, 18944, 18961, 18978, 18995, 19013, 19030, 19047, 19064, 19081, 19099, 19116, 19133, 19150, 19168, 19185, 19202, 19220, 19237, 19254, 19272, 19289, 19306, 19324, 19341, 19359, 19376, 19394, 19411, 19429, 19446, 19464, 19482, 19499, 19517, 19534, 19552, 19570, 19587, 19605, 19623, 19640, 19658, 19676, 19694, 19711, 19729, 19747, 19765, 19783, 19801, 19819, 19836, 19854, 19872, 19890, 19908, 19926, 19944, 19962, 19980, 19998, 20016, 20034, 20052, 20071, 20089, 20107, 20125, 20143, 20161, 20179, 20198, 20216, 20234, 20252, 20271, 20289, 20307, 20326, 20344, 20362, 20381, 20399, 20418, 20436, 20455, 20473, 20492, 20510, 20529, 20547, 20566, 20584, 20603, 20621, 20640, 20659, 20677, 20696, 20715, 20733, 20752, 20771, 20790, 20808, 20827, 20846, 20865, 20884, 20902, 20921, 20940, 20959, 20978, 20997, 21016, 21035, 21054, 21073, 21092, 21111, 21130, 21149, 21168, 21187, 21206, 21226, 21245, 21264, 21283, 21302, 21322, 21341, 21360, 21379, 21399, 21418, 21437, 21457, 21476, 21496, 21515, 21534, 21554,
         21573, 21593, 21612, 21632, 21651, 21671, 21690, 21710, 21730, 21749, 21769, 21789, 21808, 21828, 21848, 21867, 21887, 21907, 21927, 21946, 21966, 21986, 22006, 22026, 22046, 22066, 22086, 22105, 22125, 22145, 22165, 22185, 22205, 22226, 22246, 22266, 22286, 22306, 22326, 22346, 22366, 22387, 22407, 22427, 22447, 22468, 22488, 22508, 22528, 22549, 22569, 22590, 22610, 22630, 22651, 22671, 22692, 22712, 22733, 22753, 22774, 22794, 22815, 22836, 22856, 22877, 22897, 22918, 22939, 22960, 22980, 23001, 23022, 23043, 23063, 23084, 23105, 23126, 23147, 23168, 23189, 23210, 23230, 23251, 23272, 23293, 23315, 23336, 23357, 23378, 23399, 23420, 23441, 23462, 23483, 23505, 23526, 23547, 23568, 23590, 23611, 23632, 23654, 23675, 23696, 23718, 23739, 23761, 23782, 23804, 23825, 23847, 23868, 23890, 23911, 23933, 23954, 23976, 23998, 24019, 24041, 24063, 24084, 24106, 24128, 24150, 24172, 24193, 24215, 24237, 24259, 24281, 24303, 24325, 24347, 24369, 24391, 24413, 24435, 24457, 24479, 24501, 24523, 24545, 24567, 24590, 24612, 24634, 24656, 24679, 24701, 24723, 24746, 24768, 24790, 24813, 24835, 24857, 24880, 24902, 24925, 24947, 24970, 24992, 25015, 25038, 25060, 25083, 25105, 25128, 25151, 25174, 25196, 25219, 25242, 25265, 25287, 25310, 25333, 25356, 25379, 25402, 25425, 25448, 25471, 25494, 25517, 25540, 25563, 25586, 25609, 25632, 25655, 25678, 25702, 25725, 25748, 25771, 25795, 25818, 25841, 25864, 25888, 25911, 25935, 25958, 25981, 26005, 26028, 26052, 26075, 26099, 26123, 26146, 26170, 26193, 26217, 26241, 26264, 26288, 26312, 26336, 26359, 26383, 26407, 26431, 26455, 26479, 26502, 26526, 26550, 26574, 26598, 26622, 26646, 26670, 26695, 26719, 26743, 26767, 26791, 26815, 26839, 26864, 26888, 26912, 26937, 26961, 26985, 27010, 27034, 27058, 27083, 27107, 27132, 27156, 27181, 27205, 27230, 27254, 27279, 27304, 27328, 27353, 27378, 27402, 27427, 27452, 27477, 27502, 27526, 27551, 27576, 27601, 27626, 27651, 27676, 27701, 27726, 27751, 27776, 27801,
