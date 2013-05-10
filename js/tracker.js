@@ -8,12 +8,15 @@ function debug(){
 
 function Tracker(playerSelector){
     playerSelector = playerSelector || "#player";
-    var downSample = 1, channelMix = true, self = this;
     var context = window.webkitAudioContext ? new webkitAudioContext() : new AudioContext(),
+        downSample = Math.floor(context.sampleRate/44100); //aim for 44.1k
+    var self = this,
         bufferSize = 4096,
         sampleRate = context.sampleRate / downSample,
+        oneSampleRate = 1/sampleRate,
         compressor = context.createDynamicsCompressor(),
-        processor = context.createScriptProcessor(bufferSize);//.createJavaScriptNode(2048, 1, 2),
+        analyzer = context.createAnalyser(),
+        processor = context.createScriptProcessor(bufferSize),
         filter = context.createBiquadFilter(),
         player = $(playerSelector),
         playerElement = player[0],
@@ -24,7 +27,7 @@ function Tracker(playerSelector){
         rowIndex = 0,
         currentTick = 0,
         speed = 3,
-        currentPattern = null;
+        currentPattern = null,
         visiblePattern = -1,
         minPeriod = 1,
         maxPeriod = 150, //?? ingen aning om vad som är rimligt
@@ -33,28 +36,95 @@ function Tracker(playerSelector){
         maxProcessTime = 1000 * bufferSize / sampleRate,
         tickRate = 0,
         updateCallback = null,
+        progressCallback = null,
         patternJumpPos = null,
-        patternBreakPos = null;
+        patternBreakPos = null,
+        instrumentInfo = {},
+        lagging = false;
 
     if(downSample != 1)
         debug('sample rate down from ' + context.sampleRate + ' to ' + sampleRate);
+    else
+        debug('using sample rate ' + sampleRate);
 
     //init audio
     window._trackerprocessor = processor; //dummmy to keep chrome's GC from interfering
     processor.onaudioprocess = process;
-    filter.frequency.value=6000;
+    filter.type=5;
+    filter.frequency.value=400;
+    filter.Q.value=400;
+    filter.gain.value=3;
+    analyzer.smoothingTimeConstant = 0.3;
+    analyzer.fftSize = 1024;
     processor.connect(filter);
     filter.connect(compressor);
-    compressor.connect(context.destination);
+    compressor.connect(analyzer);
+    analyzer.connect(context.destination);
+
+    this.getFilter = function() {
+      return filter;
+    };
 
     // Public
+    this.setDownsample = function(v) {
+        if(!isNaN(v)){ // && (v == 1 || v == 2 || v == 4)
+            downSample = v;
+            sampleRate = Math.round(context.sampleRate / downSample);
+            oneSampleRate = 1/sampleRate;
+            maxProcessTime = 1000 * bufferSize / sampleRate;
+            tickRate = sampleRate*60 / tempo / 4 / 6;
+            debug('using sample rate ' + sampleRate);
+        } else
+            debug('downsample',v,'not supported. 1,2 or 4 accepted');
+    }
+    var playing = [];
+    this.startNote = function(note, inst) {
+        playing.push(note);
+        var c = playing.length;
+        channels[c].inst = inst;
+        channels[c].samplepos = 0;
+        channels[c].period = note;
+        channels[c].mp = note;
+        recalc(channels[c]);
+    };
+    this.endNote = function(note, inst) {
+        var c = -1;
+        for(var i=0; i<song.ChannelsCount && c<0; i++)
+        {
+            if(channels[i].mp == note)
+                c = i;
+        }
+        var removed = playing.splice(playing.indexOf(note),1)
+        if(c > -1){
+            channels[c].mp = null;
+            channels[c].period = 96;
+            recalc(channels[c]);
+        }
+    };
+    this.isPlaying = function() {return isPlaying;};
     this.onUpdate = function(f){ updateCallback = f;};
+    this.onProgress = function(f) { progressCallback = f; }
+    this.onLoading = function() { isPlaying = false; };
     this.onLoaded = function(data) {
+        debug('loaded');
+        channels = [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}];
+        isPlaying = false;
+        tickOffset = 0;
+        patternPos = 0;
+        rowIndex = 0;
+        currentTick = 0;
+        speed = 3,
+        currentPattern = null;
+        visiblePattern = -1,
+        singlePattern = false;
         song = data;
+        oneChannel = (1.0/song.ChannelsCount);
         speed = song.InitialSpeed;
         tempo = song.InitialTempo;
         //måste räknas om, men den kan ligga här så länge iom att inga effekter som ändrar hastigheten
         tickRate = sampleRate*60 / tempo / 4 / 6; //byte per sek / beats per min / 4 notes per beat
+        song.isLinear = (song.Flags & modFlags.UF_LINEAR) == modFlags.UF_LINEAR;
+        song.useXmPeriods = (song.Flags & modFlags.UF_XMPERIODS) == modFlags.UF_XMPERIODS;
         initInstruments();
         initLayout();
         showPattern(song.Positions[0]);
@@ -132,7 +202,13 @@ function Tracker(playerSelector){
         singlePattern = v;
         return this;
     };
-    var handledEffects = [1,2,3,5,8,9,10,12,13,14,15,16,17,18,19,21,23];
+    this.getAnalyzerData = function(){
+      var arr = new Uint8Array(analyzer.frequencyBinCount);
+      analyzer.getByteFrequencyData(arr);
+      return arr;
+    };
+    var handledEffects = /*0,7,20,22,24,25,26*/[1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,21,23, 234,235];
+    /*224 + [0-15] Exy */
     this.getEffectSummary = function(onlyUnhandled){
         var out = [], p, t,c;
         try {
@@ -147,10 +223,13 @@ function Tracker(playerSelector){
                     var cell = trk.Cells[c];
                     var fx = cell[0];
                     var fxp = cell[1];
-                    if(fx > 0 && (!onlyUnhandled || handledEffects.indexOf(fx) < 0)){
+                    if(fx == 14){
+                        fx = ((fx << 4)&0xf0) + ((fxp >> 4) & 0x0f);
+                    }
+                    if( (fx > 0 || (fx == 0 && fxp > 0)) && (!onlyUnhandled || handledEffects.indexOf(fx) < 0)){
                         var d = out[fx];
                         if(!d){
-                            d = {fx: fx, w:[]};
+                            d = {n: fx.toString(16).toUpperCase(), fx: fx, w:[]};
                             out[fx] = d;
                         }
                         d.w.push({p:p, r:t,c:c,v:fxp});
@@ -191,6 +270,10 @@ function Tracker(playerSelector){
     }
     // /Public
 
+    function setProgress(info, pos, max){
+        if(progressCallback)
+            progressCallback(info,pos,max);
+    }
     function notifyChange(){
         if(updateCallback)
             updateCallback(patternPos, song.Positions[patternPos], speed, tempo);
@@ -200,22 +283,25 @@ function Tracker(playerSelector){
         var start = window.performance.now();
         var buf=[e.outputBuffer.getChannelData(0), e.outputBuffer.getChannelData(1)];
         var len=e.outputBuffer.length;
+        var advanceFn = update;
         if (!isPlaying){
-            for(var i=0; i<len; i++){
+            advanceFn = function(){};
+            /*for(var i=0; i<len; i++){
                 buf[0][i] = buf[1][i] = 0.0;
             }
-            return;
+            return;*/
         }
 
         var out=[];
         var last=0;
-        for(var i=0; i<len; i += downSample){
-            /*for(var j=last; j<i; j++){ //om nersamplad
+        var ds = downSample;
+        for(var i=0; i<len; i += ds){
+            for(var j=last; j<i; j++){ //om nersamplad
                 buf[0][j] = out[0];
                 buf[1][j] = out[1];
-            }*/
+            }
             last = i;
-            update();
+            advanceFn();
             out[0] = out[1] = 0.0;
             for(var c=0; c<song.ChannelsCount; c++)
             {
@@ -227,7 +313,7 @@ function Tracker(playerSelector){
                     var buffer = instr.WaveData;
 
                     if (buffer.length > channel.samplepos) {
-                        var v = (1.0/song.ChannelsCount)* buffer[Math.floor(channel.samplepos)]*channel.volume;
+                        var v = oneChannel* buffer[Math.floor(channel.samplepos)]*channel.volume;
 
                         out[c&1] += v;
                         channel.samplepos += channel.rate;
@@ -260,7 +346,7 @@ function Tracker(playerSelector){
 
         if((window.performance.now() - start) > maxProcessTime)
         {
-            console.log('lag!');
+            lagging = true;
         }
         //trackProcessTime(window.performance.now() - start);
     }
@@ -331,8 +417,12 @@ function Tracker(playerSelector){
         }
     }
 
+    var one2 = 0.5;
+    var one12 = 1/12.0;
+    var one16 = 1/16.0;
     var one64 = 1/64.0;
     var one256 = 1/256.0;
+    var one768 = 1/768.0;
     function playNote(channelNum, note) {
         var channel = channels[channelNum],
             n = note[NoteData.Note],
@@ -358,7 +448,7 @@ function Tracker(playerSelector){
 
         var instr = song.Instruments[channel.inst];
         if(i && instr){
-            channel.volume = instr.Samples[0].Volume * one64; //Mja ja vet inte riktigt om den här ska sättas..
+            channel.volume = instr.Samples[0].Volume * one64;
         }
 
         if(n != null){
@@ -372,25 +462,25 @@ function Tracker(playerSelector){
 
         if(instr && e == 0){
             //TODO
-            channel.arpeggio = [
-                channel.period,
-                getPeriod(n + instr.Samples[0].Transpose + (channel.fxp & 0xf0 >>4), instr.Samples[0].C2Spd),
-                getPeriod(n + instr.Samples[0].Transpose + (channel.fxp & 0x0f), instr.Samples[0].C2Spd)];
+            channel.arpeggio = {
+                base:channel.period,
+                lo:getPeriod(n + instr.Samples[0].Transpose + (channel.fxp & 0xf0 >>4), instr.Samples[0].C2Spd),
+                hi:getPeriod(n + instr.Samples[0].Transpose + (channel.fxp & 0x0f), instr.Samples[0].C2Spd)};
         } else {
             channel.arpeggio = null;
         }
 
         if(e == 1 || e == 19){
-            channel.slidespeed = channel.fxp << 4;
+            channel.slidespeed = ((song.isLinear || e == 19) ? (12*channel.fxp) >> 8 : channel.fxp*one16);
             channel.portTarget = 0;
             //console.log('port up ', channel.fxp);
         } else if(e == 2 || e == 18){
-            channel.slidespeed = -(channel.fxp << 4);
+            channel.slidespeed = -((song.isLinear || e == 18) ? (12*channel.fxp) >> 8 : channel.fxp*one16);
             channel.portTarget = 0;
             //console.log('port dn ', channel.fxp);
         } else if ((e == 3 || e == 5) && channel.inst) {//portamento to note
             if(tempNote){ //no note, no new slide. but keep existing
-                channel.slidespeed = channel.fxp << 4;
+                channel.slidespeed = (song.isLinear || e == 18) ? (12*channel.fxp) >> 8 : channel.fxp*one16;
                 if (channel.period < tempNote)//target < source, then reduce
                     channel.slidespeed = -channel.slidespeed;
                 //console.log('port to note from',tempNote, 'to', channel.period, 'by', channel.slidespeed);
@@ -401,16 +491,28 @@ function Tracker(playerSelector){
             channel.slidespeed = 0;
         }
 
-        //if(e == 4 || e == 6){} //vibrato, vibrato + volslide
+        if(e == 4 || e == 6){//vibrato, vibrato + volslide
+            //console.log('setting vibrato ', channel.fxp, channel.fxp.toString(16), (channel.fxp & 0xf0) >> 4    , channel.fxp & 0x0f);
+            var s = (channel.fxp & 0xf0) >> 4,
+                d = channel.fxp & 0x0f;
+            if(s && d){
+                channel.vibrato = {
+                    speed:s,
+                    depth:d,
+                    period:channel.period,
+                    pos:0};
+            }
+        } else {
+            channel.vibrato = null;
+        }
 
-        if (e == 8) // offset
+        if (e == 8)
         {
             channel.pan = channel.fxp * one256;
         }
 
         if (e == 9 || e == 18) // offset
         {
-            //channel.offset = channel.fxp << 8;
             channel.samplepos = channel.fxp << 8;
         }
 
@@ -435,12 +537,12 @@ function Tracker(playerSelector){
             patternBreakPos = p; //p och inte fxp, dvs inte föregående värdet på hopp.
         }
         if(e == 14){
-            var mod = channel.fxp&0xf0,
+            var mod = (channel.fxp&0xf0) >> 8,
                 d= channel.fxp&0x0f;
-            if(mod==160) { //ea
+            if(mod==10) { //ea
                 channel.volume += d*one64;
                 if(channel.volume >= 1) channel.volume = 1;
-            } else if(mod == 176){
+            } else if(mod == 11){ //eb
                 channel.volume -= d*one64;
                 if(channel.volume <= 0) channel.volume = 0;
             }
@@ -477,9 +579,9 @@ function Tracker(playerSelector){
     }
 
     function updateChannel(chid, channel) {
-        if(channel.tick && channel.slidespeed){
+        if(channel.slidespeed){
             var p = channel.period,
-                inc = channel.slidespeed >> 8;
+                inc = channel.slidespeed;
             channel.period += inc;//(10.0*channel.slidespeed) / 256.0; //en oktav per 256 speed
 
             //console.log('port by', inc, 'from',p,'to', channel.period, '[',channel.portTarget,']');
@@ -523,6 +625,17 @@ function Tracker(playerSelector){
                     channel.tremorindex++;
                 }
             }
+        }
+
+        if(channel.vibrato && channel.tick){
+            var pos = channel.vibrato.pos & 0x3f,
+                t = VibratoTable[pos]*channel.vibrato.depth*one16;
+
+            channel.period = channel.vibrato.period + t;
+
+            //console.log('vibrato',pos, t, channel.period);
+            channel.vibrato.pos += channel.vibrato.speed;
+            channel.recalc = true;
         }
 /*
         if (channel.portSpeed) {
@@ -574,7 +687,8 @@ function Tracker(playerSelector){
 
 
     function freq2rate(period) {
-        return (song.Flags & modFlags.UF_LINEAR) ? getFreq2(period) / sampleRate : (3579546 << 2) / (period * sampleRate);
+        return song.isLinear ? getFreq2(period) * oneSampleRate : (3579546 << 2) / (period * sampleRate);
+        //return (song.Flags & modFlags.UF_LINEAR) ? getFreq2(period) / sampleRate : (3579546 << 2) / (period * sampleRate);
     }
 
     function getRate(note, instr, portamento) {
@@ -591,28 +705,34 @@ function Tracker(playerSelector){
     function getFreq2(period)
     {
         period = 7680 - Math.floor(period);
-        var okt = Math.floor(period / 768),
-            frequency = lintab[period % 768];
+        var okt = Math.floor(period * one768),
+            frequency = lintab[period - (okt*768)];
+        //var okt = Math.floor(period / 768),
+        //    frequency = lintab[period % 768];
         frequency <<= 2;
         return (frequency >> (7 - okt));
     }
 
     function getPeriod(note, speed) {
-        if (song.Flags & modFlags.UF_XMPERIODS)
+        if (song.useXmPeriods)
         {
-            return (song.Flags & modFlags.UF_LINEAR) ? getLinearPeriod(note, speed) : getLogPeriod(note, speed);
+            return song.isLinear ? getLinearPeriod(note, speed) : getLogPeriod(note, speed);
         }
         return getOldPeriod(note, speed);
     }
 
     function getLinearPeriod(note, fine) {
-        return ((10 * 12 * 16 * 4) - (note * 16 * 4) - (fine / 2) + 64);
+        return 7680 - (note * 64) - (fine * one2) + 64;
+        //return ((10 * 12 * 16 * 4) - (note * 16 * 4) - (fine / 2) + 64);
     }
     function getLogPeriod(note, fine) {
         var n, o, p1, p2, i;
 
-        n = Math.round(note) % 12;
-        o = Math.floor(note / 12);
+        o = Math.floor(note * one12);
+        n = Math.round(note) -  o*12;
+
+        //n = Math.round(note) % 12;
+        //o = Math.floor(note / 12);
         i = (n << 3) + (fine >> 4); /* n*8 + fine/16 */
 
         p1 = logtab[i];
@@ -642,8 +762,10 @@ function Tracker(playerSelector){
             return 4242;
 
         var nn = Math.floor(note);
-        var n = nn % 12;
-        var o = Math.floor(note / 12);
+        var o = Math.floor(note * one12);
+        var n = nn - o*12;
+        //var n = nn % 12;
+        //var o = Math.floor(note / 12);
 
         //return ((8363 * mytab[n]) >> o) / c2spd;
 
@@ -678,9 +800,35 @@ function Tracker(playerSelector){
     }
 
     function initInstruments(){
+        setProgress("Init instruments",0,song.Instruments.length-1);
+        debug('loading instruments');
+        var t=0, c= 0,ct=0,mn=9999999,mx=0;
         $.each(song.Instruments, function () {
-            extractRawData(this);
+            if(this.Samples.length){
+                extractRawData(this);
+                var r = this.Samples[0].SampleRate;
+                t += r;
+                mn = mn < r ? mn : r;
+                mx = mx > r ? mx : r;
+                c++;
+            }
+            ct++;
+            setProgress("Init instruments",ct,song.Instruments.length-1);
         });
+        instrumentInfo = {
+            countWithSamples: c,
+            count: ct,
+            minRate: mn,
+            maxRate: mx,
+            avgRate: t / c
+        };
+        debug(instrumentInfo);
+        var rate = 22050 > mx ? 22050 : mx;
+        if(rate <= 44100){
+            debug('SampleRate aim ', rate);
+            self.setDownsample(Math.floor(context.sampleRate/rate));
+        }
+
     }
 
     function extractRawData(instrument) {
@@ -721,9 +869,12 @@ function Tracker(playerSelector){
     //GUI.. bryt ut till egen fil/class.
 
     function initLayout(){
+        $(playerSelector).empty();
+        setProgress("Creating patterns",0,song.Patterns.length-1);
         for(var i=0;i<song.Patterns.length;i++)
         {
-            debug('Creating pattern ' + (i+1) + ' of ' + song.Patterns.length);
+            setProgress("Creating patterns",i,song.Patterns.length-1);
+            //debug('Creating pattern ' + (i+1) + ' of ' + song.Patterns.length);
             createPattern(i);
         }
 
@@ -746,31 +897,29 @@ function Tracker(playerSelector){
             rows = pat.RowsCount,
             w = tracks.length < 11 ? '' : ' style="width:' + (tracks.length * 90 + 20) + 'px"';
 
-        if(!pat.html){
-            pat.html = "#pattern" + p;
-            var data = '<div class="track" id="pattern'+p+'"' + w + '>';
-            for(var n=0;n<rows; n++)
+        pat.html = "#pattern" + p;
+        var data = '<div class="track" id="pattern'+p+'"' + w + '>';
+        for(var n=0;n<rows; n++)
+        {
+            data += '<div class="row">';
+            data += "<div class=\"num" + ((n%4 == 0) ? " hl" : "") + "\">" + fillZero(n.toString(16)) + "</div>";
+            for (var r = 0; r < tracks.length; r++)
             {
-                data += '<div class="row">';
-                data += "<div class=\"num" + ((n%4 == 0) ? " hl" : "") + "\">" + fillZero(n.toString(16)) + "</div>";
-                for (var r = 0; r < tracks.length; r++)
-                {
-                    var cells = tracks[r].Cells;
-                    var nonote = cells[n][NoteData.Period] == 96;
-                    data += "<div class=\"note c" + r + "\">";
-                    data += "<div class=\"tone\">" + (nonote ? '<div class="nonote"></div>' : toNote(cells[n][NoteData.Note], cells[n][NoteData.Octave])) + "</div>";
-                    data += "<div class=\"instrument\">" + formatInstrument(cells[n][NoteData.Instrument]) + "</div>";
-                    //data += "<div class=\"vol\">" + formatVolume(cells[n][NoteData.Period]) + "</div>";
-                    data += "<div class=\"fx\">" + formatFx(cells[n][NoteData.Effect]) + "</div>";
-                    data += "<div class=\"fxp\">" + formatFxP(cells[n][NoteData.EffectData]) + "</div>";
-                    data += "</div>";
-                }
-                data += '</div>';
+                var cells = tracks[r].Cells;
+                var nonote = cells[n][NoteData.Period] == 96;
+                data += "<div class=\"note c" + r + "\">";
+                data += "<div class=\"tone\">" + (nonote ? '<div class="nonote"></div>' : toNote(cells[n][NoteData.Note], cells[n][NoteData.Octave])) + "</div>";
+                data += "<div class=\"instrument\">" + formatInstrument(cells[n][NoteData.Instrument]) + "</div>";
+                //data += "<div class=\"vol\">" + formatVolume(cells[n][NoteData.Period]) + "</div>";
+                data += "<div class=\"fx\">" + formatFx(cells[n][NoteData.Effect]) + "</div>";
+                data += "<div class=\"fxp\">" + formatFxP(cells[n][NoteData.EffectData]) + "</div>";
+                data += "</div>";
             }
             data += '</div>';
-            $(playerSelector).append(data);
-            pat.element = $(pat.html)[0];
         }
+        data += '</div>';
+        $(playerSelector).append(data);
+        pat.element = $(pat.html)[0];
     }
 
     function fillZero(v){
@@ -805,10 +954,38 @@ function Tracker(playerSelector){
     }
 
     function formatFx(i){
+        /*
         if(!i || i==0)
             return "--";
-
         return fillZero(i.toString(16));
+        */
+        if(!i || i==0)
+            return "-";
+
+        if(i < 10)
+            return i;
+        switch (i){
+            case effetcs.PTEFFECTA: return "A";
+            case effetcs.PTEFFECTB: return "B";
+            case effetcs.PTEFFECTC: return "C";
+            case effetcs.PTEFFECTD: return "D";
+            case effetcs.PTEFFECTE: return "E";
+            case effetcs.PTEFFECTF: return "F";
+            case effetcs.S3MEFFECTA: return "A";
+            case effetcs.S3MEFFECTD: return "D";
+            case effetcs.S3MEFFECTE: return "E";
+            case effetcs.S3MEFFECTF: return "F";
+            case effetcs.S3MEFFECTI: return "I";
+            case effetcs.S3MEFFECTQ: return "Q";
+            case effetcs.S3MEFFECTT: return "T";
+            case effetcs.XMEFFECTA: return "A";
+            case effetcs.XMEFFECTG: return "G";
+            case effetcs.XMEFFECTH: return "H";
+            case effetcs.XMEFFECTP: return "P";
+        }
+
+        return "-";
+        //return fillZero(i.toString(16));
     }
 
     function formatFxP(i){
@@ -838,6 +1015,7 @@ function Tracker(playerSelector){
 
 Tracker.prototype.load = function(url, onloaded){
     var self = this;
+    self.onLoading();
     $.getJSON(url, function(data){
         self.onLoaded(data);
         if(onloaded)
@@ -847,13 +1025,13 @@ Tracker.prototype.load = function(url, onloaded){
 
 
 
-function plotAudio(data, width, height) {
+function plotAudio(data, width, height, strokeStyle) {
     width = width || 1280;
     height = height || 200;
     var $canvas = $('<canvas>').attr({ width: width, height: height }).css({ cursor: 'pointer' }),
         ctx = $canvas[0].getContext('2d'),
         dw = width / data.length, x = 0, h2 = height / 2;
-    ctx.strokeStyle = '#FFF';
+    ctx.strokeStyle = strokeStyle||'#FFF';
     ctx.beginPath();
     ctx.moveTo(x, h2);
     for (var i = 0; i < data.length; ++i) {
@@ -896,6 +1074,31 @@ function extractFlags(f) {
 
     return "";
 }
+
+(function() {
+    var lastTime = 0;
+    var vendors = ['webkit', 'moz','o'];
+    for(var x = 0; x < vendors.length && !window.requestAnimationFrame; ++x) {
+        window.requestAnimationFrame = window[vendors[x]+'RequestAnimationFrame'];
+        window.cancelAnimationFrame =
+            window[vendors[x]+'CancelAnimationFrame'] || window[vendors[x]+'CancelRequestAnimationFrame'];
+    }
+
+    if (!window.requestAnimationFrame)
+        window.requestAnimationFrame = function(callback, element) {
+            var currTime = new Date().getTime();
+            var timeToCall = Math.max(0, 16 - (currTime - lastTime));
+            var id = window.setTimeout(function() { callback(currTime + timeToCall); },
+                timeToCall);
+            lastTime = currTime + timeToCall;
+            return id;
+        };
+
+    if (!window.cancelAnimationFrame)
+        window.cancelAnimationFrame = function(id) {
+            clearTimeout(id);
+        };
+}());
 
 //constants, tables etc
 var NoteData = { Effect:0, EffectData:1, Instrument:2, Note:3, Octave:4, Period:5},
@@ -942,3 +1145,76 @@ var NoteData = { Effect:0, EffectData:1, Instrument:2, Note:3, Octave:4, Period:
         (LOGFAC * 453), (LOGFAC * 450), (LOGFAC * 447),
         (LOGFAC * 443), (LOGFAC * 440), (LOGFAC * 437),
         (LOGFAC * 434), (LOGFAC * 431)];
+var VibratoTable = [
+    0, 24, 49, 74, 97, 120, 141, 161,
+        180, 197, 212, 224, 235, 244, 250, 253,
+        255, 253, 250, 244, 235, 224, 212, 197,
+        180, 161, 141, 120, 97, 74, 49, 24 ];
+for(var i=0; i<64; i++) {VibratoTable[i] = Math.sin(i/32.0*Math.PI);}
+var effetcs = {
+       PTEFFECT0: 0,
+       PTEFFECT1: 1,
+       PTEFFECT2: 2,
+       PTEFFECT3: 3,
+       PTEFFECT4: 4,
+       PTEFFECT5: 5,
+       PTEFFECT6: 6,
+       PTEFFECT7: 7,
+       PTEFFECT8: 8,
+       PTEFFECT9: 9,
+       PTEFFECTA: 10,
+       PTEFFECTB: 11,
+       PTEFFECTC: 12,
+       PTEFFECTD: 13,
+       PTEFFECTE: 14,
+       PTEFFECTF: 15,
+       S3MEFFECTA: 16,
+       S3MEFFECTD: 17,
+       S3MEFFECTE: 18,
+       S3MEFFECTF: 19,
+       S3MEFFECTI: 20,
+       S3MEFFECTQ: 21,
+       S3MEFFECTT: 22,
+       XMEFFECTA: 23,
+       XMEFFECTG: 24,
+       XMEFFECTH: 25,
+       XMEFFECTP: 26
+};
+
+var notes = [];
+notes[81] = 36+12+12;
+notes[50] = 37+12+12;
+notes[87] = 38+12+12;
+notes[51] = 39+12+12;
+notes[69] = 40+12+12;
+notes[82] = 41+12+12;
+notes[53] = 42+12+12;
+notes[84] = 43+12+12;
+notes[54] = 44+12+12;
+notes[89] = 45+12+12;
+notes[55] = 46+12+12;
+notes[85] = 47+12+12;
+notes[73] = 48+12+12;
+notes[57] = 49+12+12;
+notes[79] = 50+12+12;
+notes[48] = 51+12+12;
+notes[80] = 52+12+12;
+
+notes[90] = 36+12;
+notes[83] = 37+12;
+notes[88] = 38+12;
+notes[68] = 39+12;
+notes[67] = 40+12;
+notes[86] = 41+12;
+notes[71] = 42+12;
+notes[66] = 43+12;
+notes[72] = 44+12;
+notes[78] = 45+12;
+notes[74] = 46+12;
+notes[77] = 47+12;
+notes[188] =notes[81];
+notes[190] =notes[87];
+notes[76] = notes[50];
+notes[192] =notes[51];
+
+/* ,=Q .=W L=2 Ö=3 */
